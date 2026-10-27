@@ -298,7 +298,7 @@ extern "C" volatile uint32_t native_ufs_dpu_state;
 extern "C" volatile uint32_t native_ufs_dpu_check[8];
 // The display bank at the end of dpuEnable (fault or not), for the boot log: [0] SCTLR, [1] TCR2, [2] TTBR0 low, [3] high, [4] TCR,
 // [5] MAIR0, [6] FSR, [7] FAR low, [8] high, [9] FSYNR0, [10] FSYNR1, [11] CBAR, [12] CBA2R, [13] CBFRSYNRA, [14] sGFSR, [15] sGFSYNR0,
-// [16] sGFSYNR1, [17] sGFAR low, [18] variant (T0SZ | placed << 8 | no access flag << 9), [19] CONTEXTIDR.
+// [16] sGFSYNR1, [17] sGFAR low, [18] variant (T0SZ | placed << 8 | no access flag << 9 | Linux bank setup << 10), [19] CONTEXTIDR.
 extern "C" volatile uint32_t native_ufs_dpu_dump[20];
 // The display bank's stage 1 table: L1, then L2 for the first GiB, then kDpuSlots * kDpuSlotTables L3 tables (one per 2 MiB of a slot).
 constexpr uint32_t kDpuWindow = 0x10000000U, kDpuSlots = 4, kDpuSlotBytes = 32U << 20, kDpuSlotTables = kDpuSlotBytes >> 21;
@@ -355,8 +355,16 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
   uint32_t noAccessFlag = 0;
   PE_parse_boot_argn ("sheng-dpu-af", &noAccessFlag, sizeof (noAccessFlag));
   noAccessFlag = noAccessFlag == 1;
-  IOLog ("NativeUfs: display stage 1, T0SZ %u, tables at %llx (%s)%s\n", t0sz, pa, place ? "placed" : "XNU RAM",
-         noAccessFlag ? ", blocks without access flag" : "");
+  // sheng-dpu-linux=1: the bank set up as the 3a's Linux does it (arm_smmu_write_context_bank). The 3a's apps SMMU is "qcom,virt-smmu":
+  // the hypervisor traps its global registers, and Linux writes CBAR before turning a stream on so that the hypervisor fills in the VM's
+  // VMID; the boot loader's CBAR (VMID 0) is never written otherwise. Then TCR2 with the ASID size and SEP, cached inner-shareable walks
+  // (the display node is dma-coherent) with a 36-bit input (T0SZ 28, a walk from level 1 like 32), and TTBR0 with an ASID.
+  uint32_t linuxBank = 0;
+  PE_parse_boot_argn ("sheng-dpu-linux", &linuxBank, sizeof (linuxBank));
+  linuxBank = linuxBank == 1;
+  if (linuxBank) t0sz = 28;
+  IOLog ("NativeUfs: display stage 1, T0SZ %u, tables at %llx (%s)%s%s\n", t0sz, pa, place ? "placed" : "XNU RAM",
+         noAccessFlag ? ", blocks without access flag" : "", linuxBank ? ", Linux bank setup" : "");
   // Plain stores, not bzero: a placed table is an uncached device mapping, where DC ZVA would fault.
   for (size_t i = 0; i < bytes / sizeof (uint64_t); ++i) reinterpret_cast<volatile uint64_t *> (l1)[i] = 0;
   // Normal non-cacheable (attribute 0 = 0x44), not shareable, access flag, readable and writable at both privilege levels.
@@ -372,10 +380,22 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
   for (uint32_t t = 0; t < kDpuSlots * kDpuSlotTables; ++t) l1[(kDpuWindow >> 21) + t] = (pa + (2 + t) * 4096ULL) | 3;
   dpuClean (l1, bytes);
   const uint32_t old[5] = {read32 (cb, 0x20), read32 (cb, 0x24), read32 (cb, 0x10), read32 (cb, 0x30), read32 (cb, 0x38)};
+  const uint32_t oldCbar = read32 (smmu, 0x1000 + 4 * bank), oldCba2r = read32 (smmu, 0x1800 + 4 * bank);
   gDpuLiveCb = cb;
-  write32 (cb, 0x20, static_cast<uint32_t> (pa)); write32 (cb, 0x24, static_cast<uint32_t> (pa >> 32));
-  write32 (cb, 0x10, smmuOutputSize (smmu));         // TCR2: the SMMU's output size (IDR2 OAS)
-  write32 (cb, 0x30, t0sz | (1U << 23));              // T0SZ 32 (or 25), non-cacheable walks, 4 KiB granule, no TTBR1
+  uint32_t tcr = t0sz | (1U << 23);                   // T0SZ 32 (or 25), non-cacheable walks, 4 KiB granule, no TTBR1
+  if (linuxBank) {
+    tcr = t0sz | (1U << 8) | (1U << 10) | (3U << 12) | (1U << 23);   // T0SZ 28, IRGN0/ORGN0 write-back write-allocate, SH0 inner, no TTBR1
+    write32 (smmu, 0x1800 + 4 * bank, 1);            // CBA2R: AArch64 context
+    write32 (smmu, 0x1000 + 4 * bank, (1U << 16) | (0xfU << 12) | (3U << 8));   // CBAR: stage 1 (stage 2 bypass), write-back, NSH
+    __asm__ volatile ("dsb sy" ::: "memory");
+    write32 (cb, 0x10, smmuOutputSize (smmu) | (1U << 4) | (7U << 15));          // TCR2: output size, 16-bit ASID, SEP upstream
+    write32 (cb, 0x30, tcr);
+    write32 (cb, 0x20, static_cast<uint32_t> (pa)); write32 (cb, 0x24, static_cast<uint32_t> (pa >> 32) | (1U << 16));   // ASID 1
+  } else {
+    write32 (cb, 0x20, static_cast<uint32_t> (pa)); write32 (cb, 0x24, static_cast<uint32_t> (pa >> 32));
+    write32 (cb, 0x10, smmuOutputSize (smmu));       // TCR2: the SMMU's output size (IDR2 OAS)
+    write32 (cb, 0x30, tcr);
+  }
   write32 (cb, 0x38, 0x44);                           // MAIR attribute 0: normal non-cacheable
   __asm__ volatile ("dsb sy" ::: "memory");
   volatile uint32_t *c = native_ufs_dpu_check;
@@ -384,13 +404,14 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
     write32 (cb, 0x0, oldSctlr);
     __asm__ volatile ("dsb sy; isb" ::: "memory");
     write32 (cb, 0x20, old[0]); write32 (cb, 0x24, old[1]); write32 (cb, 0x10, old[2]); write32 (cb, 0x30, old[3]); write32 (cb, 0x38, old[4]);
+    if (linuxBank) {write32 (smmu, 0x1000 + 4 * bank, oldCbar); write32 (smmu, 0x1800 + 4 * bank, oldCba2r);}
     const uint32_t fsr = read32 (cb, 0x58);
     if (fsr & (1U << 30)) write32 (cb, 0x8, 1);        // RESUME: terminate a stalled transaction
     if (fsr & kDpuFaults) write32 (cb, 0x58, fsr);     // write one to clear
     dpuTlbFlush (cb);
     native_ufs_dpu_state = why;
   };
-  if (c[0] != static_cast<uint32_t> (pa) || c[1] != (t0sz | (1U << 23))) {undo (0xdead0003U); return;}   // the bank ignores our writes
+  if (c[0] != static_cast<uint32_t> (pa) || c[1] != tcr) {undo (0xdead0003U); return;}   // the bank ignores our writes
   if (!dpuTlbFlush (cb)) {undo (0xdead0004U); return;}
   write32 (cb, 0x0, 1U | (1U << 5) | (1U << 6));      // SCTLR: M, CFRE, CFIE; a fault terminates instead of stalling the display
   __asm__ volatile ("dsb sy; isb" ::: "memory");
@@ -409,7 +430,7 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
     for (unsigned i = 0; i < 11; ++i) d[i] = read32 (cb, regs[i]);
     d[11] = read32 (smmu, 0x1000 + 4 * bank); d[12] = read32 (smmu, 0x1800 + 4 * bank); d[13] = read32 (smmu, 0x1400 + 4 * bank);
     d[14] = read32 (smmu, 0x48); d[15] = read32 (smmu, 0x50); d[16] = read32 (smmu, 0x54); d[17] = read32 (smmu, 0x40);
-    d[18] = t0sz | (place ? 1U << 8 : 0) | (noAccessFlag << 9); d[19] = read32 (cb, 0x34);
+    d[18] = t0sz | (place ? 1U << 8 : 0) | (noAccessFlag << 9) | (linuxBank << 10); d[19] = read32 (cb, 0x34);
   }
   if (fsr & kDpuFaults) {
     c[4] = read32 (cb, 0x60); c[5] = read32 (cb, 0x64); c[6] = read32 (cb, 0x68);
