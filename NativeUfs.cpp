@@ -288,6 +288,10 @@ extern "C" volatile uint32_t native_ufs_extra_atos[8];
 extern "C" volatile uint32_t native_ufs_dpu_smmu[24];
 extern "C" volatile uint32_t native_ufs_dpu_state;
 extern "C" volatile uint32_t native_ufs_dpu_check[8];
+// The display bank at the end of dpuEnable (fault or not), for the boot log: [0] SCTLR, [1] TCR2, [2] TTBR0 low, [3] high, [4] TCR,
+// [5] MAIR0, [6] FSR, [7] FAR low, [8] high, [9] FSYNR0, [10] FSYNR1, [11] CBAR, [12] CBA2R, [13] CBFRSYNRA, [14] sGFSR, [15] sGFSYNR0,
+// [16] sGFSYNR1, [17] sGFAR low, [18] variant (T0SZ | placed << 8 | no access flag << 9), [19] CONTEXTIDR.
+extern "C" volatile uint32_t native_ufs_dpu_dump[20];
 // The display bank's stage 1 table: L1, then L2 for the first GiB, then kDpuSlots * kDpuSlotTables L3 tables (one per 2 MiB of a slot).
 constexpr uint32_t kDpuWindow = 0x10000000U, kDpuSlots = 4, kDpuSlotBytes = 32U << 20, kDpuSlotTables = kDpuSlotBytes >> 21;
 static uint64_t *gDpuTables;
@@ -311,7 +315,6 @@ static bool dpuTlbFlush (uintptr_t cb)
 }
 static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t oldSctlr)
 {
-  (void) smmu;
   const size_t bytes = (2 + kDpuSlots * kDpuSlotTables) * 4096;
   // asteroids diagnostics (the 3a's display faulted at level 0 on its first fetch with the defaults): sheng-dpu-t0sz=25 makes the walk a
   // real three-level one from level 1 (the same table serves, [0] then acting as the level 2 table); sheng-dpu-tables=<physical address>
@@ -339,7 +342,13 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
   gDpuLock = IOLockAlloc ();
   if (!l1 || !pa || !gDpuLock) {native_ufs_dpu_state = 0xdead0002U; return;}
   uint64_t *l2 = l1 + 512;
-  IOLog ("NativeUfs: display stage 1, T0SZ %u, tables at %llx (%s)\n", t0sz, pa, place ? "placed" : "XNU RAM");
+  // sheng-dpu-af=1: the identity blocks without their access flag. A walker that reaches them must then report an access flag fault, not
+  // a translation fault; a translation fault means it never got to our entries.
+  uint32_t noAccessFlag = 0;
+  PE_parse_boot_argn ("sheng-dpu-af", &noAccessFlag, sizeof (noAccessFlag));
+  noAccessFlag = noAccessFlag == 1;
+  IOLog ("NativeUfs: display stage 1, T0SZ %u, tables at %llx (%s)%s\n", t0sz, pa, place ? "placed" : "XNU RAM",
+         noAccessFlag ? ", blocks without access flag" : "");
   // Plain stores, not bzero: a placed table is an uncached device mapping, where DC ZVA would fault.
   for (size_t i = 0; i < bytes / sizeof (uint64_t); ++i) reinterpret_cast<volatile uint64_t *> (l1)[i] = 0;
   // Normal non-cacheable (attribute 0 = 0x44), not shareable, access flag, readable and writable at both privilege levels.
@@ -349,8 +358,9 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
   // blocks, [128 + t] the window's level 3 tables. The second page stays unused.
   (void) l2;
   l1[0] = pa | 3;
-  l1[2] = 0x80000000ULL | attrs | 1;
-  l1[3] = 0xc0000000ULL | attrs | 1;
+  const uint64_t blockAttrs = noAccessFlag ? attrs & ~(1ULL << 10) : attrs;
+  l1[2] = 0x80000000ULL | blockAttrs | 1;
+  l1[3] = 0xc0000000ULL | blockAttrs | 1;
   for (uint32_t t = 0; t < kDpuSlots * kDpuSlotTables; ++t) l1[(kDpuWindow >> 21) + t] = (pa + (2 + t) * 4096ULL) | 3;
   dpuClean (l1, bytes);
   const uint32_t old[5] = {read32 (cb, 0x20), read32 (cb, 0x24), read32 (cb, 0x10), read32 (cb, 0x30), read32 (cb, 0x38)};
@@ -385,6 +395,14 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
     IODelay (500);
   }
   c[3] = fsr; c[7] = us;
+  {
+    volatile uint32_t *d = native_ufs_dpu_dump;
+    const uint32_t regs[11] = {0x0, 0x10, 0x20, 0x24, 0x30, 0x38, 0x58, 0x60, 0x64, 0x68, 0x6c};
+    for (unsigned i = 0; i < 11; ++i) d[i] = read32 (cb, regs[i]);
+    d[11] = read32 (smmu, 0x1000 + 4 * bank); d[12] = read32 (smmu, 0x1800 + 4 * bank); d[13] = read32 (smmu, 0x1400 + 4 * bank);
+    d[14] = read32 (smmu, 0x48); d[15] = read32 (smmu, 0x50); d[16] = read32 (smmu, 0x54); d[17] = read32 (smmu, 0x40);
+    d[18] = t0sz | (place ? 1U << 8 : 0) | (noAccessFlag << 9); d[19] = read32 (cb, 0x34);
+  }
   if (fsr & kDpuFaults) {
     c[4] = read32 (cb, 0x60); c[5] = read32 (cb, 0x64); c[6] = read32 (cb, 0x68);
     undo (0xdead0005U); return;
@@ -1382,6 +1400,7 @@ extern "C" volatile uint32_t native_ufs_dpu_smmu[24] = {};
 extern "C" volatile uint32_t native_ufs_dpu_state = 0;
 // TTBR0 low and TCR read back, FSR before and after the 50 ms watch, FAR low and high and FSYNR0 of the first fault, us watched.
 extern "C" volatile uint32_t native_ufs_dpu_check[8] = {};
+extern "C" volatile uint32_t native_ufs_dpu_dump[20] = {};
 // The display bank's SCTLR (reg 0) or FSR (reg 1) now, for the log; all ones before the bank was touched.
 extern "C" uint32_t native_ufs_dpu_live (unsigned reg)
 {
