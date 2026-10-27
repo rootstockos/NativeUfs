@@ -23,6 +23,7 @@ extern const uint8_t verified_root_key[];
 #include <kern/thread.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSData.h>
@@ -312,14 +313,35 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
 {
   (void) smmu;
   const size_t bytes = (2 + kDpuSlots * kDpuSlotTables) * 4096;
-  IOBufferMemoryDescriptor *tables = IOBufferMemoryDescriptor::inTaskWithOptions (
-    kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
-    static_cast<IOOptionBits> (kIOMemoryMapperNone), bytes, 4096);
+  // asteroids diagnostics (the 3a's display faulted at level 0 on its first fetch with the defaults): sheng-dpu-t0sz=25 makes the walk a
+  // real three-level one from level 1 (the same table serves, [0] then acting as the level 2 table); sheng-dpu-tables=<physical address>
+  // puts the tables there instead of in XNU's RAM (the 3a: the unused tail of the display's own splash region), mapped uncached.
+  uint32_t t0sz = 32;
+  PE_parse_boot_argn ("sheng-dpu-t0sz", &t0sz, sizeof (t0sz));
+  if (t0sz != 25) t0sz = 32;
+  uint64_t place = 0;
+  PE_parse_boot_argn ("sheng-dpu-tables", &place, sizeof (place));
+  IOBufferMemoryDescriptor *tables = nullptr;
+  static IOMemoryMap *placedMap;
+  uint64_t *l1 = nullptr;
+  uint64_t pa = 0;
+  if (place && !(place & 4095)) {
+    IODeviceMemory *range = IODeviceMemory::withRange (place, bytes);
+    placedMap = range ? range->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    if (range) range->release ();
+    if (placedMap) {l1 = reinterpret_cast<uint64_t *> (placedMap->getVirtualAddress ()); pa = place;}
+  } else {
+    tables = IOBufferMemoryDescriptor::inTaskWithOptions (
+      kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+      static_cast<IOOptionBits> (kIOMemoryMapperNone), bytes, 4096);
+    if (tables) {l1 = static_cast<uint64_t *> (tables->getBytesNoCopy ()); pa = tables->getPhysicalSegment (0, nullptr, kIOMemoryMapperNone);}
+  }
   gDpuLock = IOLockAlloc ();
-  if (!tables || !gDpuLock) {native_ufs_dpu_state = 0xdead0002U; return;}
-  uint64_t *l1 = static_cast<uint64_t *> (tables->getBytesNoCopy ()), *l2 = l1 + 512;
-  const uint64_t pa = tables->getPhysicalSegment (0, nullptr, kIOMemoryMapperNone);
-  bzero (l1, bytes);
+  if (!l1 || !pa || !gDpuLock) {native_ufs_dpu_state = 0xdead0002U; return;}
+  uint64_t *l2 = l1 + 512;
+  IOLog ("NativeUfs: display stage 1, T0SZ %u, tables at %llx (%s)\n", t0sz, pa, place ? "placed" : "XNU RAM");
+  // Plain stores, not bzero: a placed table is an uncached device mapping, where DC ZVA would fault.
+  for (size_t i = 0; i < bytes / sizeof (uint64_t); ++i) reinterpret_cast<volatile uint64_t *> (l1)[i] = 0;
   // Normal non-cacheable (attribute 0 = 0x44), not shareable, access flag, readable and writable at both privilege levels.
   const uint64_t attrs = (1ULL << 10) | (1ULL << 6);
   // i564: the first fetch faulted at once with FSYNR0 level 0, so the walk may start at level 0 although T0SZ 32 means level 1. One table
@@ -335,7 +357,7 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
   gDpuLiveCb = cb;
   write32 (cb, 0x20, static_cast<uint32_t> (pa)); write32 (cb, 0x24, static_cast<uint32_t> (pa >> 32));
   write32 (cb, 0x10, 5);                              // TCR2: 48-bit output
-  write32 (cb, 0x30, 32U | (1U << 23));               // T0SZ 32, non-cacheable walks, 4 KiB granule, no TTBR1
+  write32 (cb, 0x30, t0sz | (1U << 23));              // T0SZ 32 (or 25), non-cacheable walks, 4 KiB granule, no TTBR1
   write32 (cb, 0x38, 0x44);                           // MAIR attribute 0: normal non-cacheable
   __asm__ volatile ("dsb sy" ::: "memory");
   volatile uint32_t *c = native_ufs_dpu_check;
@@ -350,7 +372,7 @@ static void dpuEnable (uintptr_t smmu, uintptr_t cb, uint32_t bank, uint32_t old
     dpuTlbFlush (cb);
     native_ufs_dpu_state = why;
   };
-  if (c[0] != static_cast<uint32_t> (pa) || c[1] != (32U | (1U << 23))) {undo (0xdead0003U); return;}   // the bank ignores our writes
+  if (c[0] != static_cast<uint32_t> (pa) || c[1] != (t0sz | (1U << 23))) {undo (0xdead0003U); return;}   // the bank ignores our writes
   if (!dpuTlbFlush (cb)) {undo (0xdead0004U); return;}
   write32 (cb, 0x0, 1U | (1U << 5) | (1U << 6));      // SCTLR: M, CFRE, CFIE; a fault terminates instead of stalling the display
   __asm__ volatile ("dsb sy; isb" ::: "memory");
